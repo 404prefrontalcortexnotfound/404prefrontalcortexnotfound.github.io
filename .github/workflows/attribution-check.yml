@@ -1,0 +1,77 @@
+name: attribution check
+
+# Fails a PR if any disallowed AI / model / private-identity attribution appears
+# in the PR's commit messages OR in tracked file content. CHECK-ONLY: this never
+# rewrites a remote commit object — remediation is done locally by the author.
+#
+# Issue: Decent-Tako/skills-and-governance#72 (child of epic #68).
+# Engine: scripts/agent-attribution-scrub.sh + rules/attribution-denylist.txt.
+#
+# This workflow is BOTH:
+#   1. The live gate for THIS repo (pull_request trigger below), and
+#   2. A reusable workflow (workflow_call) other repos in the same checkout can
+#      reference. NOTE: workflow_call shares the CALLER's checkout, and the
+#      scrubber's --check-repo/--check-staged scan the tree the SCRIPT lives in.
+#      For a DIFFERENT repo to scan its OWN files, it must VENDOR the script +
+#      denylist into itself and call this workflow's standalone copy — see
+#      docs/agents/attribution-ci-rollout.md. workflow_call here is provided for
+#      same-repo reuse / composition; cross-repo adopters vendor.
+
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      skip-repo-scan:
+        description: "Skip the file-content tree scan; check commit messages only (for repos with un-cleaned legacy file content)."
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  attribution:
+    name: no disallowed attribution
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 — the commit-message loop walks the full PR range; a
+      # shallow checkout would not contain the base commit to diff against.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run attribution scrubber (check-only) over commits + files
+        env:
+          # On pull_request these are the real base/head SHAs. On workflow_call
+          # / push the action falls back to origin/<default>..HEAD.
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          SKIP_REPO_SCAN: ${{ inputs.skip-repo-scan && '1' || '0' }}
+          # Injected via env (NOT ${{ }} inside run:) so a fork whose default-branch
+          # name contains shell metacharacters cannot achieve RCE on the runner.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${PR_BASE:-}"
+          HEAD="${PR_HEAD:-}"
+          if [ -z "$BASE" ] || [ -z "$HEAD" ]; then
+            # Not a pull_request event: diff the default branch against HEAD.
+            DEFAULT="${DEFAULT_BRANCH:-}"
+            DEFAULT="${DEFAULT:-main}"
+            # Fetch the default branch into a remote-tracking ref. An explicit
+            # refspec guarantees origin/$DEFAULT exists (a bare `git fetch origin
+            # $DEFAULT` only populates FETCH_HEAD). `--depth=0` is INVALID (git
+            # shallow depth must be >= 1) — checkout above already used
+            # fetch-depth: 0, so a full-history fetch is correct here.
+            git fetch --no-tags origin "+refs/heads/$DEFAULT:refs/remotes/origin/$DEFAULT"
+            BASE="origin/$DEFAULT"
+            HEAD="HEAD"
+          fi
+          # Fail loudly if either endpoint is not actually present — a silent
+          # absent ref would otherwise make the diff vacuously "clean".
+          git cat-file -t "$BASE" >/dev/null 2>&1 || { echo "::error::base ref $BASE not present"; exit 2; }
+          git cat-file -t "$HEAD" >/dev/null 2>&1 || { echo "::error::head ref $HEAD not present"; exit 2; }
+          echo "Base: $BASE   Head: $HEAD   SKIP_REPO_SCAN=$SKIP_REPO_SCAN"
+          bash scripts/ci-attribution-check.sh "$BASE" "$HEAD"
